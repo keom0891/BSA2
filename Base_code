@@ -98,11 +98,7 @@ def process_roads(roads_path, raster_path, pts_reusable, vul_db, road_meta, haza
         arcpy.management.Delete(pts_vals)
     sample_raster_to_points(pts_reusable, raster_path, pts_vals, value_field="RASTERVALU")
 
-    # 2) Ensure point result fields that exist
-    for field in ["damage", "loss"]:
-        ensure_field(pts_vals, field)
-
-    # 3) Calculate the component damage and loss 
+    # 2) Calculate the component damage and loss 
     road_cost = road_meta["road_cost_m"]
     oid_sum, oid_vul = {}, {}
     has_lq = any(f.name.upper() == "LQ_VAL" for f in arcpy.ListFields(pts_vals))
@@ -121,7 +117,7 @@ def process_roads(roads_path, raster_path, pts_reusable, vul_db, road_meta, haza
             if not np.isfinite(rv_val):
                 continue
 
-            # 3a) Compute damages per road OID
+            # 2a) Compute damages per road OID
             full_key_rmd = build_vul_key(road_meta, hazard_type, rid=rid, lq=lq_val, curve_type="RMD")
             if full_key_rmd in vul_db:
                 xs_rmd, ys_rmd = vul_db[full_key_rmd]
@@ -132,7 +128,7 @@ def process_roads(roads_path, raster_path, pts_reusable, vul_db, road_meta, haza
                     loss = dmg * max(trib_len or 0.0, 0.0) * road_cost.get(rid, 0.0)
                     oid_sum[rid] = oid_sum.get(rid, 0.0) + loss
 
-            # 3b) Compute losses per road OID
+            # 2b) Compute losses per road OID
             full_key_T = build_vul_key(road_meta, hazard_type, rid=rid, lq=lq_val, curve_type="T")
             if full_key_T in vul_db:
                 xs_T, ys_T = vul_db[full_key_T]
@@ -144,11 +140,11 @@ def process_roads(roads_path, raster_path, pts_reusable, vul_db, road_meta, haza
                     if (prev_best is None) or (vul_val > prev_best):
                         oid_vul[rid] = vul_val
 
-    # 4) Delete the temporal values not needed
+    # 3) Delete the temporal values not needed
     if arcpy.Exists(pts_vals):
         arcpy.management.Delete(pts_vals)
 
-    # 5) Return the oid values needed
+    # 4) Return the oid values needed
     return oid_sum, oid_vul 
 
 
@@ -157,45 +153,49 @@ def process_component(comp_name, comp_path, raster_path, vul_db, hazard_type):
     comp_pts = fr"in_memory\{comp_name}_pts"
     sample_raster_to_points(comp_path, raster_path, comp_pts, value_field="RASTERVALU")
 
-    # 2) Ensure point result fields actually exist
-    for field in ["damage", "loss"]:
-        ensure_field(comp_pts, field)
-
-    # 3) Calculate the component damage and loss 
+    # 2) Calculate the component damage and loss 
     hz_lower = (hazard_type or "").strip().lower()
     is_eq = hz_lower in ("earthquake", "eq")
     vul_field = "vul_eq" if is_eq else "vul_f"
     has_lq = any(f.name.upper() == "LQ_VAL" for f in arcpy.ListFields(comp_pts))
-    fields = ["OID@", vul_field, "RASTERVALU", "rep_cost", "damage", "loss"] + (["LQ_VAL"] if has_lq else [])
-    oid_sum = {}
-    with arcpy.da.UpdateCursor(comp_pts, fields) as cur:
+    fields = ["OID@", vul_field, "RASTERVALU", "rep_cost"] + (["LQ_VAL"] if has_lq else [])
+    oid_sum, oid_vul = {}, {}
+    with arcpy.da.SearchCursor(comp_pts, fields) as cur:
         for row in cur:
             if has_lq:
-                oid, vkey, rv, rep_val, dmg, loss, lq_val = row
+                oid, vkey, rv, rep_val, lq_val = row
             else:
-                oid, vkey, rv, rep_val, dmg, loss = row
+                oid, vkey, rv, rep_val = row
                 lq_val = None
-            key = build_vul_key(None, hazard_type, vkey=vkey, lq=lq_val, curve_type="RMD")
+
+            # 2a) Compute damages per road OID
+            key_rmd = build_vul_key(None, hazard_type, vkey=vkey, lq=lq_val, curve_type="RMD")
             dmg_val = 0.0
-            if key and key in vul_db:
-                xs, ys = vul_db[key]
+            if key_rmd and key_rmd in vul_db:
+                xs, ys = vul_db[key_rmd]
                 if xs and ys and rv is not None:
                     lo, hi = min(xs), max(xs)
                     xq = max(min(float(rv), hi), lo)
-                    dmg_val = float(np.interp(xq, xs, ys)) / 100.0
-            loss_val = dmg_val * float(rep_val)
-            oid_sum[oid] = loss_val
-            if has_lq:
-                cur.updateRow([oid, vkey, rv, rep_val, dmg_val, loss_val, lq_val])
-            else:
-                cur.updateRow([oid, vkey, rv, rep_val, dmg_val, loss_val])
+                    dmg_val = (float(np.interp(xq, xs, ys)) / 100.0) * float(rep_val)
+            oid_sum[oid] = dmg_val 
 
-    # 4) Delete the temporal values not needed
+            # 2b) Compute losses per road OID
+            key_T = build_vul_key(None, hazard_type, vkey=vkey, lq=lq_val, curve_type="T")
+            vul_val = 0.0
+            if key_T and key_T in vul_db:
+                xs_T, ys_T = vul_db[key_T]
+                if xs_T and ys_T and rv is not None:
+                    lo_T, hi_T = min(xs_T), max(xs_T)
+                    xq_T = max(min(float(rv), hi_T), lo_T)
+                    vul_val = float(np.interp(xq_T, xs_T, ys_T)) / 24.0
+            oid_vul[oid] = vul_val
+
+    # 3) Delete the temporal values not needed
     if arcpy.Exists(comp_pts):
         arcpy.management.Delete(comp_pts)
 
-    # 5) Return the oid values needed
-    return oid_sum
+    # 4) Return the oid values needed
+    return oid_sum, oid_vul
 
 
 def sample_raster_to_points(points_fc, raster_path, out_fc, value_field="RASTERVALU"):
@@ -605,6 +605,44 @@ def write_damage_by_oid(fc, roads_path, oid_to_loss, field_name):
             cur.updateRow(row)
 
 
+def tramo_dlt_from_roads(road_fc, dlt_by_oid: Dict[int, float]):
+    # 1) Resolve segment identifier field on the road layer
+    tramo_field = find_field(road_fc, "ID_TRAMO")
+    if not tramo_field:
+        raise RuntimeError("ID_TRAMO field not found on road layer (needed to map DLT to components).")
+
+    # 2) Get ObjectID field name for the road feature class
+    oid_field = arcpy.Describe(road_fc).OIDFieldName
+
+    # 3) Build mapping for components: tramo_id -> DLT value
+    tramo_to_dlt: Dict[object, float] = {}
+    with arcpy.da.SearchCursor(road_fc, [oid_field, tramo_field]) as cur:
+        for oid, tramo in cur:
+            tramo_to_dlt[tramo] = float(dlt_by_oid.get(oid, 0.0))
+
+    # 4) Return DLT aggregated at tramo level
+    return tramo_to_dlt
+
+
+def map_component_dlt_by_tramo(comp_fc, tramo_to_dlt: Dict[object, float]):
+    # 1) Resolve segment identifier field on the component layer
+    tramo_field = find_field(comp_fc, "ID_TRAMO")
+    if not tramo_field:
+        raise RuntimeError(f"ID_TRAMO field not found on {comp_fc} (needed to map DLT to components).")
+
+    # 2) Get ObjectID field name for the component feature class
+    oid_field = arcpy.Describe(comp_fc).OIDFieldName
+
+    # 3) Build mapping for components: component OID -> DLT value
+    out: Dict[int, float] = {}
+    with arcpy.da.SearchCursor(comp_fc, [oid_field, tramo_field]) as cur:
+        for oid, tramo in cur:
+            out[int(oid)] = float(tramo_to_dlt.get(tramo, 0.0))
+
+    # 4) Return per-component DLT mapping
+    return out
+
+
 def sum_component_DAE_by_tramo(comp_fc):
     # 1) Resolve tramo field (ID_TRAMO) or fail
     tramo_field = find_field(comp_fc, "ID_TRAMO")
@@ -796,7 +834,10 @@ def main():
         raise RuntimeError("ID_TRAMO field not found on road_damage.")
 
     # 13) Iterate each hazard raster/TR and compute damages
-    vul_mem: Dict[str, Dict[int, Dict[int, float]]] = defaultdict(lambda: defaultdict(dict))
+    vul_mem_roads: Dict[str, Dict[int, Dict[int, float]]] = defaultdict(lambda: defaultdict(dict))
+    vul_mem_bridge: Dict[str, Dict[int, Dict[int, float]]] = defaultdict(lambda: defaultdict(dict))
+    vul_mem_tunnel: Dict[str, Dict[int, Dict[int, float]]] = defaultdict(lambda: defaultdict(dict))
+    vul_mem_drain: Dict[str, Dict[int, Dict[int, float]]] = defaultdict(lambda: defaultdict(dict))
     for raster_path, hz in ras_haz:
         hz_key = (hz or "").strip().lower()
         base = arcpy.Describe(raster_path).baseName
@@ -817,11 +858,11 @@ def main():
         )
         write_damage_by_oid(road_damage, roads_path, oid_to_loss, field_name)
         for rid, v in oid_to_vul.items():
-            vul_mem[hz_key][tr][rid] = float(v)
+            vul_mem_roads[hz_key][tr][rid] = float(v)
 
         # 13b) Bridges
         if bridge_damage and bridge_path and arcpy.Exists(bridge_damage):
-            oid_to_loss_bridge = process_component(
+            oid_to_loss_bridge, oid_to_vul_bridge = process_component(
                 comp_name="bridge",
                 comp_path=bridge_path,
                 raster_path=raster_path,
@@ -829,10 +870,12 @@ def main():
                 hazard_type=hz_key,
             )
             write_damage_by_oid(bridge_damage, bridge_path, oid_to_loss_bridge, field_name)
+            for oid, v in oid_to_vul_bridge.items():
+                vul_mem_bridge[hz_key][tr][oid] = float(v)
 
         # 13c) Tunnels
         if tunnel_damage and tunnel_path and arcpy.Exists(tunnel_damage):
-            oid_to_loss_tunnel = process_component(
+            oid_to_loss_tunnel, oid_to_vul_tunnel = process_component(
                 comp_name="tunnel",
                 comp_path=tunnel_path,
                 raster_path=raster_path,
@@ -840,10 +883,12 @@ def main():
                 hazard_type=hz_key,
             )
             write_damage_by_oid(tunnel_damage, tunnel_path, oid_to_loss_tunnel, field_name)
+            for oid, v in oid_to_vul_tunnel.items():
+                vul_mem_tunnel[hz_key][tr][oid] = float(v)
 
         # 13d) Drainage
         if draina_damage and draina_path and arcpy.Exists(draina_damage):
-            oid_to_loss_drain = process_component(
+            oid_to_loss_drain, oid_to_vul_drain = process_component(
                 comp_name="drainage",
                 comp_path=draina_path,
                 raster_path=raster_path,
@@ -851,6 +896,8 @@ def main():
                 hazard_type=hz_key,
             )
             write_damage_by_oid(draina_damage, draina_path, oid_to_loss_drain, field_name)
+            for oid, v in oid_to_vul_drain.items():
+                vul_mem_drain[hz_key][tr][oid] = float(v)
 
     # 14) Compute DAE fields per component and total
     for fc in [road_damage, bridge_damage, tunnel_damage, draina_damage]:
@@ -875,7 +922,19 @@ def main():
 
     # 17) Run road-loss analysis and compute and write PAE fields
     dlt_by_oid = road_loss_analysis(road_damage, operat_data, gdppca_doub)
-    compute_PAE_fields(road_damage, hazard_to_TRs_sorted, dlt_by_oid, vul_mem)
+    compute_PAE_fields(road_damage, hazard_to_TRs_sorted, dlt_by_oid, vul_mem_roads)
+    tramo_to_dlt = tramo_dlt_from_roads(road_damage, dlt_by_oid)
+    if bridge_damage and arcpy.Exists(bridge_damage):
+        dlt_bridge_by_oid = map_component_dlt_by_tramo(bridge_damage, tramo_to_dlt)
+        compute_PAE_fields(bridge_damage, hazard_to_TRs_sorted, dlt_bridge_by_oid, vul_mem_bridge)
+
+    if tunnel_damage and arcpy.Exists(tunnel_damage):
+        dlt_tunnel_by_oid = map_component_dlt_by_tramo(tunnel_damage, tramo_to_dlt)
+        compute_PAE_fields(tunnel_damage, hazard_to_TRs_sorted, dlt_tunnel_by_oid, vul_mem_tunnel)
+
+    if draina_damage and arcpy.Exists(draina_damage):
+        dlt_drain_by_oid = map_component_dlt_by_tramo(draina_damage, tramo_to_dlt)
+        compute_PAE_fields(draina_damage, hazard_to_TRs_sorted, dlt_drain_by_oid, vul_mem_drain)
 
     # 18) Create Priority field = DAE_total + PAE_total
     ensure_field(road_damage, "Priority", "DOUBLE")
